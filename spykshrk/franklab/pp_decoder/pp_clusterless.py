@@ -35,7 +35,7 @@ class OfflinePPEncoder(object):
         grp = self.spk_amp.groupby('elec_grp_id')
         observations = {}
         task = []
-        chunksize = 2000
+        # chunksize = 100
         for tet_id, spk_tet in grp:
             spk_tet.index = spk_tet.index.droplevel('elec_grp_id')
             tet_lin_pos = (self.linflat.get_irregular_resampled(spk_tet.index.get_level_values('timestamp'))
@@ -45,7 +45,7 @@ class OfflinePPEncoder(object):
             tet_lin_pos_thresh = tet_lin_pos.get_above_velocity(self.speed_thresh)
             spk_tet_thresh = spk_tet.reindex(tet_lin_pos_thresh.index)
             # Decode from all spikes
-            dask_spk_tet = dd.from_pandas(spk_tet.get_simple_index(), chunksize=chunksize)
+            dask_spk_tet = dd.from_pandas(spk_tet.get_simple_index(), chunksize=self.chunksize)
 
             df_meta = pd.DataFrame([], columns=[pos_col_format(ii, self.encode_settings.pos_num_bins)
                                                 for ii in range(self.encode_settings.pos_num_bins)])
@@ -96,18 +96,18 @@ class OfflinePPEncoder(object):
 class OfflinePPDecoder(object):
     """
     Implementation of Adaptive Marked Point Process Decoder [Deng, et. al. 2015].
-    
+
     Requires linearized position (spykshrk.franklab.pp_decoder.LinearPositionContainer)
     and spike observation containers (spykshrk.franklab.pp_decoder.SpikeObservation).
-    along with encoding (spykshrk.franklab.pp_decoder.EncodeSettings) 
+    along with encoding (spykshrk.franklab.pp_decoder.EncodeSettings)
     and decoding settings (spykshrk.franklab.pp_decoder.DecodeSettings).
-    
+
     """
     def __init__(self, lin_obj: LinearPosition, observ_obj: SpikeObservation, encode_settings: EncodeSettings,
-                 decode_settings: DecodeSettings, which_trans_mat='learned', time_bin_size=30, parallel=True):
+                 decode_settings: DecodeSettings, which_trans_mat='learned', time_bin_size=30, parallel=True, chunksize=30000):
         """
         Constructor for OfflinePPDecoder.
-        
+
         Args:
             lin_obj (LinearPositionContainer): Linear position of animal.
             observ_obj (SpikeObservation): Observered position distribution for each spike.
@@ -123,6 +123,7 @@ class OfflinePPDecoder(object):
         self.decode_settings = decode_settings
         self.which_trans_mat = which_trans_mat
         self.time_bin_size = time_bin_size
+        self.chunksize = chunksize
 
         if self.which_trans_mat == 'learned':
             self.trans_mat = self.calc_learned_state_trans_mat(self.lin_obj.get_mapped_single_axis(),
@@ -148,7 +149,7 @@ class OfflinePPDecoder(object):
         """
         Run the decoder at a given time bin size.  Intermediate results are saved as
         attributes to the class.
-        
+
         Args:
             time_bin_size (float, optional): Delta time per bin.
 
@@ -193,10 +194,10 @@ class OfflinePPDecoder(object):
         Calculate the point process transition matrix using the real behavior of the animal.
         This is the 2D matrix that defines the possible range of transitions in the position
         estimate.
-        
+
         The learned values are smoothed with a gaussian kernel and a uniform offset is added,
         specified by the encoding config.  The matrix is column normalized.
-        
+
         Args:
             linpos_simple (pd.DataFrame): Linear position pandas table with no MultiIndex.
             enc_settings (EncodeSettings): Encoder settings from a realtime config.
@@ -253,7 +254,7 @@ class OfflinePPDecoder(object):
     def calc_simple_trans_mat(enc_settings):
         """
         Calculate a simple point process transition matrix using a gaussian kernel.
-        
+
         Args:
             enc_settings (EncodeSettings): Encoder setting from realtime config.
 
@@ -286,7 +287,7 @@ class OfflinePPDecoder(object):
     def calc_uniform_trans_mat(enc_settings):
         """
         Calculate a simple uniform point process transition matrix.
-        
+
         Args:
             enc_settings (EncodeSettings): Encoder setting from realtime config.
 
@@ -314,7 +315,7 @@ class OfflinePPDecoder(object):
                                    dec_settings: DecodeSettings,
                                    time_bin_size=None):
         """
-        
+
         Args:
             observ (SpikeObservation): Object containing observation data frame, one row per spike observed.
             enc_settings (EncodeSettings): Encoder settings from realtime config.
@@ -339,7 +340,7 @@ class OfflinePPDecoder(object):
 
         observ.update_num_missing_future_bins(inplace=True)
 
-        observ_dask = dd.from_pandas(observ.get_no_multi_index(), chunksize=30000)
+        observ_dask = dd.from_pandas(observ.get_no_multi_index(), chunksize=self.chunksize)
         observ_grp = observ_dask.groupby('parallel_bin')
 
         observ_meta = [(key, 'f8') for key in [pos_col_format(ii, enc_settings.pos_num_bins)
@@ -469,7 +470,7 @@ class OfflinePPDecoder(object):
     @staticmethod
     def calc_occupancy(lin_obj: LinearPosition, enc_settings: EncodeSettings):
         """
-        
+
         Args:
             lin_obj (LinearPositionContainer): Linear position of the animal.
             enc_settings (EncodeSettings): Realtime encoding settings.
@@ -489,7 +490,7 @@ class OfflinePPDecoder(object):
     @staticmethod
     def calc_prob_no_spike(firing_rate: dict, occupancy, enc_settings: EncodeSettings, dec_settings: DecodeSettings):
         """
-        
+
         Args:
             firing_rate (pd.DataFrame): Occupancy firing rate, from calc_observation_intensity(...).
             occupancy (np.array): The occupancy of the animal.
@@ -508,7 +509,7 @@ class OfflinePPDecoder(object):
     @staticmethod
     def calc_posterior(likelihoods, transition_mat, enc_settings: EncodeSettings):
         """
-        
+
         Args:
             likelihoods (pd.DataFrame): The evaluated likelihood function per time bin, from calc_likelihood(...).
             transition_mat (np.array): The point process state transition matrix.
