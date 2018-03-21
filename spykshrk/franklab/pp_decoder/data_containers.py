@@ -61,17 +61,17 @@ class DataFrameClass(pd.DataFrame, metaclass=ABCMeta):
 
     def __init__(self, data=None, index=None, columns=None, dtype=None, copy=False, parent=None, history=None, **kwds):
         """
-        
+
         Args:
-            data: 
-            index: 
-            columns: 
-            dtype: 
-            copy: 
+            data:
+            index:
+            columns:
+            dtype:
+            copy:
             parent: Uses parent history if avaliable.
-            history: List that is set as the history of this object.  
+            history: List that is set as the history of this object.
                 Overrides both the history of the parent and data source.
-            **kwds: 
+            **kwds:
         """
         # print('called for {} with shape {}'.format(type(data), data.shape))
         self.uuid = uuid.uuid4()
@@ -145,13 +145,31 @@ class DayEpochEvent(DataFrameClass):
                 raise DataFormatError("DataFrame index must use MultiIndex as index.")
 
             if not all([col in data.index.names for col in ['day', 'epoch', 'event']]):
-                raise DataFormatError("DayEpochTimeSeries must have index with 3 levels named: "
+                raise DataFormatError("DayEpochEvent must have index with 3 levels named: "
                                       "day, epoch, event.")
+
+            if not all([col in data.columns for col in ['starttime', 'endtime']]):
+                raise DataFormatError("RippleTimes must contain columns 'starttime' and 'endtime'.")
 
         if index is not None and not isinstance(index, pd.MultiIndex):
             raise DataFormatError("Index to be set must be MultiIndex.")
 
         super().__init__(**kwds)
+
+    def get_range_view(self):
+        return self[['starttime', 'endtime']]
+
+    def get_num_events(self):
+        return len(self)
+
+    def find_events(self, times):
+        event_id_list = []
+        for time in times:
+            res = self.query('starttime < @time and endtime > @time')
+            id_list = res.index.get_level_values('event')
+            event_id_list.extend(id_list)
+
+        return event_id_list
 
 
 class DayEpochTimeSeries(DataFrameClass):
@@ -228,9 +246,9 @@ class DayEpochTimeSeries(DataFrameClass):
 
     def get_resampled(self, bin_size):
         """
-        
+
         Args:
-            bin_size: size of time 
+            bin_size: size of time
 7
         Returns (LinearPositionContainer): copy of self with times resampled using backfill.
 
@@ -263,15 +281,38 @@ class DayEpochTimeSeries(DataFrameClass):
         return type(self)(pos_data_rebinned, history=self.history, **self.kwds)
 
     def get_irregular_resampled(self, timestamps):
+        return self.iloc[self.get_simple_index().index.get_indexer_for(timestamps, method='nearest')]
 
-        grp = self.groupby(level=['day', 'epoch'])
-        for (day, epoch), grp_df in grp:
-            ind = pd.MultiIndex.from_arrays([[day]*len(timestamps), [epoch]*len(timestamps),
-                                             timestamps, np.array(timestamps)/
-                                             float(self.sampling_rate)],
-                                            names=['day', 'epoch', 'timestamp', 'time'])
+        # grp = self.groupby(level=['day', 'epoch'])
+        # for (day, epoch), grp_df in grp:
+        #     grp_df.get_simple_index.resample(timestamps)
+        #     ind = pd.MultiIndex.from_arrays([[day]*len(timestamps), [epoch]*len(timestamps),
+        #                                      timestamps, np.array(timestamps)/
+        #                                      float(self.sampling_rate)],
+        #                                     names=['day', 'epoch', 'timestamp', 'time'])
+        #
+        #     return grp_df.reindex(ind, method='ffill')
 
-            return grp_df.reindex(ind, method='ffill', fill_value=0)
+    def apply_time_event(self, time_ranges: DayEpochEvent, event_mask_name='event_grp'):
+        grouping = np.full(len(self), -1)
+        time_index = self.index.get_level_values('time')
+        for event_id, (range_start, range_end) in zip(time_ranges.index.get_level_values('event'),
+                                                       time_ranges.get_range_view().values):
+            range_mask = (time_index > range_start) & (time_index < range_end)
+            grouping[range_mask] = event_id
+
+        self[event_mask_name] = grouping
+
+        return self
+
+    def get_simple_index(self):
+        """
+        Only use if MultiIndex has been selected for day, epoch, and tetrode.
+        Returns:
+
+        """
+
+        return self.set_index(self.index.get_level_values('timestamp'))
 
 
 class DayEpochElecTimeChannelSeries(DayEpochTimeSeries):
@@ -325,7 +366,7 @@ class EncodeSettings:
     """
     def __init__(self, realtime_config):
         """
-        
+
         Args:
             realtime_config (dict[str, *]): JSON realtime configuration imported as a dict
         """
@@ -370,7 +411,7 @@ class DecodeSettings:
     """
     def __init__(self, realtime_config):
         """
-        
+
         Args:
             realtime_config (dict[str, *]): JSON realtime configuration imported as a dict
         """
@@ -446,8 +487,8 @@ class SpikeFeatures(DayEpochElecTimeSeries):
 
 class LinearPosition(DayEpochTimeSeries):
     """
-    Container for Linearized position read from an AnimalInfo.  
-    
+    Container for Linearized position read from an AnimalInfo.
+
     The linearized position can come from Frank Lab's Matlab data read by the NSpike data parser
     (spykshrk.realtime.simulator.nspike_data), using the AnimalInfo class to parse the directory
     structure and PosMatDataStream to parse the linearized position files.
@@ -467,18 +508,18 @@ class LinearPosition(DayEpochTimeSeries):
             self.arm_coord = None
 
     @classmethod
-    def create_default(cls, df, sampling_rate, parent=None, **kwds):
+    def create_default(cls, df, sampling_rate, arm_coord, parent=None, **kwds):
         if parent is None:
             parent = df
 
-        return cls(sampling_rate=sampling_rate, df=df, parent=parent, **kwds)
+        return cls(df=df, sampling_rate=sampling_rate, arm_coord=arm_coord, parent=parent, **kwds)
 
     @classmethod
     def from_nspike_posmat(cls, nspike_pos_data, enc_settings: EncodeSettings, parent=None):
         """
-        
+
         Args:
-            parent: 
+            parent:
             nspike_pos_data: The position panda table from an animal info.  Expects a specific multi-index format.
             enc_settings: Encoder settings, used to get the endpoints of the W track
         """
@@ -500,11 +541,11 @@ class LinearPosition(DayEpochTimeSeries):
 
     def get_pd_no_multiindex(self):
         """
-        Removes the MultiIndexes, for a simplier panda table. Maintains well distances, 
+        Removes the MultiIndexes, for a simplier panda table. Maintains well distances,
         reduces velocity to just center velocity, and removes day and epoch info from index.
-        
+
         This should not be used for multi-day datasets where the timestamp resets.
-        
+
         Returns: Copy of linearized panda table with MultiIndexes removed
 
         """
@@ -524,7 +565,7 @@ class LinearPosition(DayEpochTimeSeries):
     def get_mapped_single_axis(self):
         """
         Returns linearized position converted into a segmented 1-D representation.
-        
+
         Returns (pd.DataFrame): Segmented 1-D linear position.
 
         """
@@ -744,12 +785,19 @@ class RippleTimes(DayEpochEvent):
         super().__init__(data=data, index=index, columns=columns, dtype=dtype, copy=copy, parent=parent,
                          history=history, **kwds)
 
+        if isinstance(data, pd.DataFrame):
+            if not 'maxthresh' in data.columns:
+                raise DataFormatError("RippleTimes must have 'maxthresh' column.")
+
     @classmethod
     def create_default(cls, df, time_unit: UnitTime, parent=None, **kwds):
         if parent is None:
             parent = df
 
         return cls(data=df, time_unit=time_unit, parent=parent, **kwds)
+
+    def get_above_maxthresh(self, threshold):
+        return self.query('maxthresh >= @threshold')
 
 
 class StimLockout(DataFrameClass):
@@ -770,10 +818,10 @@ class StimLockout(DataFrameClass):
     @classmethod
     def from_realtime(cls, stim_lockout, enc_settings, parent=None, **kwds):
         """
-        Class factory to create stimulation lockout from realtime system.  
+        Class factory to create stimulation lockout from realtime system.
         Reshapes the structure to a more useful format (stim lockout intervals)
         Args:
-            parent: 
+            parent:
             stim_lockout: Stim lockout pandas table from realtime records
 
         Returns: StimLockout
@@ -821,12 +869,13 @@ class FlatLinearPosition(LinearPosition):
 
 
     @classmethod
-    def from_numpy_single_epoch(cls, day, epoch, timestamp, lin_pos, lin_vel, sampling_rate):
+    def from_numpy_single_epoch(cls, day, epoch, timestamp, lin_pos, lin_vel, sampling_rate, arm_coord):
         time = timestamp/float(sampling_rate)
         return cls(pd.DataFrame(list(zip(lin_pos, lin_vel)), columns=['linpos_flat', 'linvel_flat'],
                                 index=pd.MultiIndex.from_arrays([[day]*len(timestamp), [epoch]*len(timestamp),
                                                                  timestamp, time],
-                                                                names=['day', 'epoch', 'timestamp', 'time'])))
+                                                                names=['day', 'epoch', 'timestamp', 'time'])),
+                   sampling_rate=sampling_rate, arm_coord=arm_coord)
 
     def get_above_velocity(self, threshold):
 

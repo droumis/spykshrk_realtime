@@ -4,6 +4,7 @@ import scipy as sp
 import scipy.signal
 import dask
 import dask.dataframe as dd
+import logging
 
 import functools
 import ipyparallel as ipp
@@ -13,17 +14,32 @@ from spykshrk.util import Groupby
 from spykshrk.franklab.pp_decoder.data_containers import LinearPosition, SpikeObservation, EncodeSettings, \
     DecodeSettings, Posteriors, pos_col_format
 
-import spykshrk.franklab.pp_decoder.pp_clusterless_cy as pp_cy
-
+logger = logging.getLogger(__name__)
 
 class OfflinePPEncoder(object):
 
-    def __init__(self, linflat, spk_amp, speed_thresh, encode_settings: EncodeSettings):
+    def __init__(self, linflat, spk_amp, speed_thresh, encode_settings: EncodeSettings,
+                 dask_worker_memory=None, dask_memory_utilization=0.5, dask_chunksize=None):
+
+        if dask_worker_memory is None and dask_chunksize is None:
+            raise TypeError('OfflinePPEncoder requires either dask_memory or dask_chunksize to be set.')
+        if dask_worker_memory is not None and dask_chunksize is not None:
+            raise TypeError('OfflinePPEncoder only allows one to be set, dask_memory or dask_chunksize.')
+        if dask_chunksize is not None:
+            self.dask_chunksize = dask_chunksize
+        if dask_worker_memory is not None:
+            memory_per_dec = (len(spk_amp) * np.sum([np.dtype(dtype).itemsize for dtype in spk_amp.dtypes]))
+            self.dask_chunksize = np.int(dask_memory_utilization * dask_worker_memory / memory_per_dec)
+            logger.info('Dask chunksize: {}'.format(self.dask_chunksize))
+            logger.info('Memory utilization at: {:0.1f}%'.format(dask_memory_utilization * 100))
+            logger.info('Expected worker memory usage: {:0.2f} MB'.format(self.dask_chunksize * memory_per_dec / 2**20))
+
         self.linflat = linflat
         self.spk_amp = spk_amp
         self.speed_thresh = speed_thresh
         self.encode_settings = encode_settings
         self.calc_occupancy()
+
 
     def calc_occupancy(self):
         occ, _ = np.histogram(a=self.linflat['linpos_flat'], bins=self.encode_settings.pos_bin_edges, normed=True)
@@ -31,21 +47,29 @@ class OfflinePPEncoder(object):
         return self.occupancy
 
     def run_encoder(self):
+        task = self.setup_encoder_dask()
+        results = dask.compute(*task)
+        return results
+
+    def setup_encoder_dask(self):
 
         grp = self.spk_amp.groupby('elec_grp_id')
         observations = {}
         task = []
-        # chunksize = 100
+        chunksize = 1000
         for tet_id, spk_tet in grp:
             spk_tet.index = spk_tet.index.droplevel('elec_grp_id')
             tet_lin_pos = (self.linflat.get_irregular_resampled(spk_tet.index.get_level_values('timestamp'))
                            .get_mapped_single_axis())
-
+            # tet_lin_pos = self.linflat.iloc[
+            #     self.linflat.index.get_level_values('timestamp').
+            #     get_indexer_for(spk_tet.index.get_level_values('timestamp'), method='nearest')
+            #     ]
             # Velocity threshold on spikes and position
             tet_lin_pos_thresh = tet_lin_pos.get_above_velocity(self.speed_thresh)
-            spk_tet_thresh = spk_tet.reindex(tet_lin_pos_thresh.index)
+            spk_tet_thresh = spk_tet.set_index(tet_lin_pos_thresh.index)
             # Decode from all spikes
-            dask_spk_tet = dd.from_pandas(spk_tet.get_simple_index(), chunksize=self.chunksize)
+            dask_spk_tet = dd.from_pandas(spk_tet.get_simple_index(), chunksize=self.dask_chunksize)
 
             df_meta = pd.DataFrame([], columns=[pos_col_format(ii, self.encode_settings.pos_num_bins)
                                                 for ii in range(self.encode_settings.pos_num_bins)])
@@ -57,8 +81,7 @@ class OfflinePPEncoder(object):
                                                                       encode_settings=self.encode_settings),
                                                     meta=df_meta))
 
-        results = dask.compute(*task)
-        return results
+        return task
 
     def compute_observ_tet(self, dec_spk, enc_spk, tet_lin_pos, occupancy, encode_settings):
 
@@ -104,7 +127,8 @@ class OfflinePPDecoder(object):
 
     """
     def __init__(self, lin_obj: LinearPosition, observ_obj: SpikeObservation, encode_settings: EncodeSettings,
-                 decode_settings: DecodeSettings, which_trans_mat='learned', time_bin_size=30, parallel=True, chunksize=30000):
+                 decode_settings: DecodeSettings, which_trans_mat='learned', time_bin_size=30, parallel=True,
+                 dask_worker_memory=None, dask_memory_utilization=0.5, dask_chunksize=None):
         """
         Constructor for OfflinePPDecoder.
 
@@ -116,6 +140,19 @@ class OfflinePPDecoder(object):
             which_trans_mat (str): Which point process transition matrix to use (learned, simple, uniform).
             time_bin_size (float, optional): Delta time per bin to run decode, defaults to decoder_settings value.
         """
+        if dask_worker_memory is None and dask_chunksize is None:
+            raise TypeError('OfflinePPDecoder requires either dask_memory or dask_chunksize to be set.')
+        if dask_worker_memory is not None and dask_chunksize is not None:
+            raise TypeError('OfflinePPDecoder only allows one to be set, dask_memory or dask_chunksize.')
+        if dask_chunksize is not None:
+            self.dask_chunksize = dask_chunksize
+        if dask_worker_memory is not None:
+            memory_per_dec = (len(spk_amp) * np.sum([np.dtype(dtype).itemsize for dtype in spk_amp.dtypes]))
+            self.dask_chunksize = np.int(dask_memory_utilization * dask_worker_memory / memory_per_dec)
+            logger.info('Dask chunksize: {}'.format(self.dask_chunksize))
+            logger.info('Memory utilization at: {:0.1f}%'.format(dask_memory_utilization * 100))
+            logger.info('Expected worker memory usage: {:0.2f} MB'.format(self.dask_chunksize * memory_per_dec / 2**20))
+
         self.lin_obj = lin_obj
         self.observ_obj = observ_obj
         self.observ_obj = observ_obj
@@ -123,7 +160,6 @@ class OfflinePPDecoder(object):
         self.decode_settings = decode_settings
         self.which_trans_mat = which_trans_mat
         self.time_bin_size = time_bin_size
-        self.chunksize = chunksize
 
         if self.which_trans_mat == 'learned':
             self.trans_mat = self.calc_learned_state_trans_mat(self.lin_obj.get_mapped_single_axis(),
@@ -182,7 +218,8 @@ class OfflinePPDecoder(object):
                                                            self.prob_no_spike,
                                                            self.encode_settings,
                                                            self.decode_settings,
-                                                           time_bin_size=self.time_bin_size)
+                                                           time_bin_size=self.time_bin_size,
+                                                           chunksize=self.dask_chunksize)
 
     def recalc_posterior(self):
         self.posteriors = self.calc_posterior(self.likelihoods, self.trans_mat, self.encode_settings)
@@ -313,7 +350,8 @@ class OfflinePPDecoder(object):
                                    prob_no_spike,
                                    enc_settings: EncodeSettings,
                                    dec_settings: DecodeSettings,
-                                   time_bin_size=None):
+                                   time_bin_size=None,
+                                   chunksize=30000):
         """
 
         Args:
@@ -326,7 +364,6 @@ class OfflinePPDecoder(object):
             Dictionary of numpy arrays, one per tetrode, containing occupancy firing rate.
 
         """
-
         day = observ.index.get_level_values('day')[0]
         epoch = observ.index.get_level_values('epoch')[0]
 
@@ -340,7 +377,7 @@ class OfflinePPDecoder(object):
 
         observ.update_num_missing_future_bins(inplace=True)
 
-        observ_dask = dd.from_pandas(observ.get_no_multi_index(), chunksize=self.chunksize)
+        observ_dask = dd.from_pandas(observ.get_no_multi_index(), chunksize=chunksize)
         observ_grp = observ_dask.groupby('parallel_bin')
 
         observ_meta = [(key, 'f8') for key in [pos_col_format(ii, enc_settings.pos_num_bins)
