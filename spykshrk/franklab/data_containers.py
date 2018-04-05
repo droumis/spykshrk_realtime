@@ -5,9 +5,14 @@ from abc import ABC, ABCMeta, abstractclassmethod, abstractmethod
 from itertools import product
 import uuid
 import enum
+import os
+import warnings
+
+from spykshrk.franklab.warnings import ConstructorWarning, OverridingAttributeWarning
 
 from spykshrk.franklab.pp_decoder.util import gaussian
 from spykshrk.util import AttrDict, EnumMapping
+
 
 
 class UnitTime(EnumMapping):
@@ -20,8 +25,9 @@ class UnitTime(EnumMapping):
 
 def partialclass(cls, *args, **kwds):
 
-    class NewCls(cls):
-        __init__ = functools.partialmethod(cls.__init__, *args, **kwds)
+    NewCls = type('_' + cls.__name__, (cls,),
+                  {'__init__': functools.partialmethod(cls.__init__, *args, **kwds),
+                   '__module__': __name__})
 
     return NewCls
 
@@ -53,13 +59,14 @@ class SeriesClass(pd.Series):
         return partialclass(DataFrameClass, history=self.history, **self.kwds)
 
 
-class DataFrameClass(pd.DataFrame, metaclass=ABCMeta):
+class DataFrameClass(pd.DataFrame):
 
     _metadata = pd.DataFrame._metadata + ['kwds', 'history']
     _internal_names = pd.DataFrame._internal_names + ['uuid']
     _internal_names_set = set(_internal_names)
 
-    def __init__(self, data=None, index=None, columns=None, dtype=None, copy=False, parent=None, history=None, **kwds):
+    def __init__(self, data=None, index=None, columns=None, dtype=None, copy=False, parent=None, history=None,
+                 custom_uuid=None, **kwds):
         """
         
         Args:
@@ -74,7 +81,11 @@ class DataFrameClass(pd.DataFrame, metaclass=ABCMeta):
             **kwds: 
         """
         # print('called for {} with shape {}'.format(type(data), data.shape))
-        self.uuid = uuid.uuid4()
+        if uuid is None:
+            self.uuid = uuid.uuid4()
+        else:
+            self.uuid = custom_uuid
+
         self.kwds = kwds
 
         if history is not None:
@@ -128,6 +139,39 @@ class DataFrameClass(pd.DataFrame, metaclass=ABCMeta):
     def create_default(cls, df, parent=None, **kwd):
         pass
 
+    def to_dataframe(self):
+        return pd.DataFrame(self)
+
+    def _to_hdf_store(self, direc, filename, hdf_base, hdf_grps, hdf_label):
+        with pd.HDFStore(os.path.join(direc, filename), 'w') as store:
+            main_path = os.path.join(hdf_base, hdf_grps, hdf_label)
+            store[main_path] = self.to_dataframe()
+            save_history = []
+            for hist_en in self.history:
+                try:
+                    save_history.append((type(hist_en), hist_en.uuid))
+                except AttributeError:
+                    save_history.append((type(hist_en), repr(hist_en)))
+
+            main_storer = store.get_storer(main_path)
+            main_storer.attrs.history = save_history
+            main_storer.attrs.kwds = self.kwds
+            main_storer.attrs.uuid = self.uuid
+            main_storer.attrs.classtype = type(self)
+
+    @classmethod
+    def _from_hdf_store(cls, direc, filename, hdf_base, hdf_grps, hdf_label):
+        with pd.HDFStore(os.path.join(direc, filename), 'r') as store:
+            main_path = os.path.join(hdf_base, hdf_grps, hdf_label)
+            dataframe = store[main_path]
+            main_storer = store.get_storer(main_path)
+            save_history = main_storer.attrs.history
+            kwds = main_storer.attrs.kwds
+            custom_uuid = main_storer.attrs.uuid
+            newcls = main_storer.attrs.classtype
+
+            return newcls(data=dataframe, history=save_history, custom_uuid=custom_uuid, **kwds)
+
     def __repr__(self):
         return '<{}: {}, shape: ({})>'.format(self.__class__.__name__, self.uuid, self.shape)
 
@@ -177,7 +221,16 @@ class DayEpochTimeSeries(DataFrameClass):
     _metadata = DataFrameClass._metadata + ['sampling_rate']
 
     def __init__(self, **kwds):
-        self.sampling_rate = kwds['sampling_rate']
+
+        if isinstance(kwds['data'], DayEpochTimeSeries):
+            self.sampling_rate = kwds['data'].sampling_rate
+            kwds['sampling_rate'] = self.sampling_rate
+        elif isinstance(kwds['data'], DataFrameClass):
+            warnings.warn(ConstructorWarning('Trying to create a DataEpochTimeSeries from a {}. '
+                                             'Not guarenteed to be compatible'.format(kwds['data'].__name__)))
+        if 'sampling_rate' in kwds:
+            self.sampling_rate = kwds['sampling_rate']
+
         data = kwds['data']
         index = kwds['index']
 
@@ -190,17 +243,12 @@ class DayEpochTimeSeries(DataFrameClass):
                                       "day, epoch, timestamp, time.")
 
             epoch_grps = data.groupby(['day', 'epoch'])
-            try:
-                kwds['kwds']['start_times'] = []
-                kwds['kwds']['start_timestamps'] = []
-            except KeyError:
-                kwds['kwds'] = {}
-                kwds['kwds']['start_times'] = []
-                kwds['kwds']['start_timestamps'] = []
+            kwds['start_times'] = []
+            kwds['start_timestamps'] = []
 
             for key, epoch_data in epoch_grps:
-                kwds['kwds']['start_times'].append(epoch_data.index.get_level_values('time')[0])
-                kwds['kwds']['start_timestamps'].append(epoch_data.index.get_level_values('timestamp')[0])
+                kwds['start_times'].append(epoch_data.index.get_level_values('time')[0])
+                kwds['start_timestamps'].append(epoch_data.index.get_level_values('timestamp')[0])
 
         if index is not None and not isinstance(index, pd.MultiIndex):
             raise DataFormatError("Index to be set must be MultiIndex.")
@@ -684,33 +732,49 @@ class SpikeObservation(DayEpochTimeSeries):
 
 class Posteriors(DayEpochTimeSeries):
 
-    _metadata = DayEpochTimeSeries._metadata + ['enc_settings']
+    _metadata = DayEpochTimeSeries._metadata + ['enc_settings', 'dec_settings']
 
     def __init__(self, data=None, index=None, columns=None, dtype=None, copy=False, parent=None, history=None,
-                 sampling_rate=0, **kwds):
+                 sampling_rate=None, enc_settings=None, dec_settings=None, **kwds):
 
-        try:
-            self.enc_settings = kwds['enc_settings']
-        except KeyError:
-            self.enc_settings = None
+        self.enc_settings = enc_settings
+
+        self.dec_settings = dec_settings
+
+        if issubclass(type(data), DataFrameClass):
+            if self.enc_settings is not None:
+                warnings.warn(OverridingAttributeWarning('enc_setting found in {} will be '
+                                                         'overwritten by constructor value'.format(data)))
+            else:
+                self.enc_settings = data.kwds['enc_settings']
+
+            if self.dec_settings is not None:
+                warnings.warn(OverridingAttributeWarning('dec_setting found in {} will be '
+                                                         'overwritten by constructor value'.format(data)))
+            else:
+                self.dec_settings = data.kwds['dec_settings']
 
         super().__init__(sampling_rate=sampling_rate, data=data, index=index, columns=columns,
-                         dtype=dtype, copy=copy, parent=parent, history=history, **kwds)
+                         dtype=dtype, copy=copy, parent=parent, history=history, enc_settings=self.enc_settings,
+                         dec_settings=self.dec_settings, **kwds)
 
     #@property
     #def _constructor(self):
     #    return functools.partial(type(self), history=self.history, **self.kwds)
 
     @classmethod
-    def create_default(cls, df, enc_settings, parent=None, **kwds):
+    def create_default(cls, df, enc_settings, dec_settings, parent=None, **kwds):
         if parent is None:
             parent = df
 
-        return cls(df, parent=parent, enc_settings=enc_settings, **kwds)
+        sampling_rate = enc_settings.sampling_rate
+
+        return cls(df, sampling_rate=sampling_rate, parent=parent, enc_settings=enc_settings,
+                   dec_settings=dec_settings, **kwds)
 
     @classmethod
-    def from_dataframe(cls, posterior: pd.DataFrame, index=None, columns=None, parent=None,
-                       encode_settings=None, **kwds):
+    def from_dataframe(cls, posterior: pd.DataFrame, enc_settings, dec_settings,
+                       index=None, columns=None, parent=None, **kwds):
         if parent is None:
             parent = posterior
 
@@ -718,21 +782,43 @@ class Posteriors(DayEpochTimeSeries):
             posterior.set_index(index)
         if columns is not None:
             posterior.columns = columns
-        return cls(data=posterior, parent=parent, enc_settings=encode_settings, **kwds)
+
+        sampling_rate = enc_settings.sampling_rate
+        return cls(data=posterior, sampling_rate=sampling_rate, parent=parent,
+                   enc_settings=enc_settings, dec_settings=dec_settings, **kwds)
 
     @classmethod
-    def from_numpy(cls, posterior, day, epoch, timestamps, times, columns=None, parent=None, encode_settings=None):
+    def from_numpy(cls, posterior, day, epoch, timestamps, times, columns=None, parent=None, sampling_rate=None,
+                   enc_settings=None):
+
+        if (sampling_rate is None) and (enc_settings is None):
+            raise DataFormatError('Posteriors.from_numpy() must specify either sampling_rate or encode_setting object.')
+        if (sampling_rate is not None) and (enc_settings is not None):
+            raise DataFormatError('Posteriors.from_numpy() only specify one, sampling rate or encode_setting.')
+
+        if enc_settings is not None:
+            sampling_rate = enc_settings.sampling_rate
+
         if parent is None:
             parent = posterior
 
         return cls(data=posterior, index=pd.MultiIndex.from_arrays([[day]*len(posterior), [epoch]*len(posterior),
                                                                     timestamps, times],
                                                                    names=['day', 'epoch', 'timestamp', 'time']),
-                   columns=columns, parent=parent, enc_settings=encode_settings)
+                   columns=columns, parent=parent, enc_settings=enc_settings, sampling_rate=sampling_rate)
 
     @classmethod
     def from_realtime(cls, posterior: pd.DataFrame, day, epoch, columns=None, copy=False, parent=None,
-                      enc_settings=None):
+                      enc_settings=None, sampling_rate=None):
+
+        if (sampling_rate is None) and (enc_settings is None):
+            raise DataFormatError('Posteriors.from_numpy() must specify either sampling_rate or encode_setting object.')
+        if (sampling_rate is not None) and (enc_settings is not None):
+            raise DataFormatError('Posteriors.from_numpy() only specify one, sampling rate or encode_setting.')
+
+        if enc_settings is not None:
+            sampling_rate = enc_settings.sampling_rate
+
         if parent is None:
             parent = posterior
 
@@ -740,13 +826,13 @@ class Posteriors(DayEpochTimeSeries):
             posterior = posterior.copy()    # type: pd.DataFrame
         posterior.set_index(pd.MultiIndex.from_arrays([[day]*len(posterior), [epoch]*len(posterior),
                                                        posterior['timestamp'], posterior['timestamp']/
-                                                       enc_settings.sampling_rate],
+                                                       sampling_rate],
                                                       names=['day', 'epoch', 'timestamp', 'time']), inplace=True)
 
         if columns is not None:
             posterior.columns = columns
 
-        return cls(data=posterior, parent=parent, enc_settings=enc_settings)
+        return cls(data=posterior, parent=parent, enc_settings=enc_settings, sampling_rate=sampling_rate)
 
     def get_posteriors_as_np(self):
         return self[pos_col_format(0, self.kwds['enc_settings'].pos_num_bins):
@@ -869,7 +955,7 @@ class FlatLinearPosition(LinearPosition):
     def get_above_velocity(self, threshold):
 
         # explicitly return copy convert weakref, for pickling
-        return pd.DataFrame(self.query('abs(linvel_flat) >= @threshold'))
+        return self.query('abs(linvel_flat) >= @threshold')
 
     def get_mapped_single_axis(self):
         return self

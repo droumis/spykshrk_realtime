@@ -25,13 +25,19 @@ class OfflinePPEncoder(object):
         if dask_worker_memory is not None and dask_chunksize is not None:
             raise TypeError('OfflinePPEncoder only allows one to be set, dask_memory or dask_chunksize.')
         if dask_chunksize is not None:
+            memory_per_dec = (len(spk_amp) * np.sum([np.dtype(dtype).itemsize for dtype in spk_amp.dtypes]))
             self.dask_chunksize = dask_chunksize
+            logger.info('Manual Dask chunksize: {}'.format(self.dask_chunksize))
+            logger.info('Expected worker peak memory usage: {:0.2f} MB'.format(self.dask_chunksize * memory_per_dec / 2**20))
+            logger.info('Worker total memory: UNKNOWN')
+
         if dask_worker_memory is not None:
             memory_per_dec = (len(spk_amp) * np.sum([np.dtype(dtype).itemsize for dtype in spk_amp.dtypes]))
             self.dask_chunksize = np.int(dask_memory_utilization * dask_worker_memory / memory_per_dec)
             logger.info('Dask chunksize: {}'.format(self.dask_chunksize))
             logger.info('Memory utilization at: {:0.1f}%'.format(dask_memory_utilization * 100))
-            logger.info('Expected worker memory usage: {:0.2f} MB'.format(self.dask_chunksize * memory_per_dec / 2**20))
+            logger.info('Expected worker peak memory usage: {:0.2f} MB'.
+                        format(self.dask_chunksize * memory_per_dec / 2**20))
 
         self.linflat = linflat
         self.spk_amp = spk_amp
@@ -46,7 +52,9 @@ class OfflinePPEncoder(object):
         return self.occupancy
 
     def run_encoder(self):
+        logging.info("Setting up encoder dask task.")
         task = self.setup_encoder_dask()
+        logging.info("Running compute tasks on dask workers.")
         results = dask.compute(*task)
         return results
 
@@ -221,7 +229,8 @@ class OfflinePPDecoder(object):
 
     def recalc_posterior(self):
         self.posteriors = self.calc_posterior(self.likelihoods, self.trans_mat, self.encode_settings)
-        self.posteriors_obj = Posteriors(self.posteriors, enc_settings=self.encode_settings)
+        self.posteriors_obj = Posteriors.from_dataframe(self.posteriors, enc_settings=self.encode_settings,
+                                                        dec_settings=self.decode_settings)
 
     @staticmethod
     def calc_learned_state_trans_mat(linpos_simple, enc_settings, dec_settings):
