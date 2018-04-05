@@ -1,6 +1,6 @@
 import numpy as np
 from spykshrk.util import AttrDict
-
+import scipy.io as sio
 
 class DataFormatError(RuntimeError):
     pass
@@ -48,6 +48,8 @@ def parse_filterframework_cells(data, level=0):
                     store[name] = np.squeeze(data[name])
 
                 return store
+    else:
+        print('hi')
     return store
 
 
@@ -77,7 +79,3 @@ def merge_filterframework_cells(data_list):
 
     else:
         raise DataFormatError('Merge failed, either unsupported data or level with different datatypes provided.')
-
-
-
-

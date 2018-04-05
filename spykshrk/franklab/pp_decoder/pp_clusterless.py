@@ -1,18 +1,17 @@
-import pandas as pd
-import numpy as np
-import scipy as sp
-import scipy.signal
-import dask
-import dask.dataframe as dd
+import functools
 import logging
 
-import functools
-import ipyparallel as ipp
+import dask
+import dask.dataframe as dd
+import numpy as np
+import pandas as pd
+import scipy as sp
+import scipy.signal
 
+from spykshrk.franklab.data_containers import LinearPosition, SpikeObservation, EncodeSettings, \
+    DecodeSettings, Posteriors, pos_col_format
 from spykshrk.franklab.pp_decoder.util import gaussian, normal2D, apply_no_anim_boundary, normal_pdf_int_lookup
 from spykshrk.util import Groupby
-from spykshrk.franklab.pp_decoder.data_containers import LinearPosition, SpikeObservation, EncodeSettings, \
-    DecodeSettings, Posteriors, pos_col_format
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +55,6 @@ class OfflinePPEncoder(object):
         grp = self.spk_amp.groupby('elec_grp_id')
         observations = {}
         task = []
-        chunksize = 1000
         for tet_id, spk_tet in grp:
             spk_tet.index = spk_tet.index.droplevel('elec_grp_id')
             tet_lin_pos = (self.linflat.get_irregular_resampled(spk_tet.index.get_level_values('timestamp'))

@@ -134,8 +134,8 @@ class DecodeVisualizer:
     def plot_all(self, time=None, x_range=None, y_range=None, plt_range=10):
         out = hv.Overlay()
 
-        # img = self.plot_decode_image(time, x_range, y_range, plt_range)
-        # out *= img
+        img = self.plot_decode_image(time, x_range, y_range, plt_range)
+        out *= img
         pos = self.plot_linear_pos(time, x_range, y_range, plt_range)
         out *= pos
         arms = self.plot_arm_boundaries(time, x_range, y_range, plt_range)
