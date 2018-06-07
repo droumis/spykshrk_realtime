@@ -74,7 +74,7 @@
         "sampling_rate": 100000,
         "mark_kernel": {
             "mean": 0,
-            "std": 5,
+            "std": 25,
             "lower": -1024,
             "upper": 1024,
             "interval": 1
@@ -82,12 +82,12 @@
 
         "position": {
             "lower": 0,
-            "upper": 450,
-            "bins": 450,
-            "arm_pos": [[0, 69], [150, 252], [300, 404]]
+            "upper": 150,
+            "bins": 150,
+            "arm_pos": [[10, 40], [45, 95], [100, 150]]
         },
         "position_kernel": {
-            "std": 1
+            "std": 3
         },
         "vel": 0,
         "spk_amp": 60

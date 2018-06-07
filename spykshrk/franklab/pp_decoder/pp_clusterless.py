@@ -8,8 +8,8 @@ import pandas as pd
 import scipy as sp
 import scipy.signal
 
-from spykshrk.franklab.data_containers import LinearPosition, SpikeObservation, EncodeSettings, \
-    DecodeSettings, Posteriors, pos_col_format
+from spykshrk.franklab.data_containers import LinearPosition, FlatLinearPosition, SpikeObservation,\
+ EncodeSettings, DecodeSettings, Posteriors, pos_col_format
 from spykshrk.franklab.pp_decoder.util import gaussian, normal2D, apply_no_anim_boundary, normal_pdf_int_lookup
 from spykshrk.util import Groupby
 
@@ -17,129 +17,12 @@ logger = logging.getLogger(__name__)
 
 class OfflinePPEncoder(object):
 
-    def __init__(self, linflat, spk_amp, speed_thresh, encode_settings: EncodeSettings,
-                 dask_worker_memory=None, dask_memory_utilization=0.5, dask_chunksize=None):
-
-        if dask_worker_memory is None and dask_chunksize is None:
-            raise TypeError('OfflinePPEncoder requires either dask_memory or dask_chunksize to be set.')
-        if dask_worker_memory is not None and dask_chunksize is not None:
-            raise TypeError('OfflinePPEncoder only allows one to be set, dask_memory or dask_chunksize.')
-        if dask_chunksize is not None:
-            memory_per_dec = (len(spk_amp) * np.sum([np.dtype(dtype).itemsize for dtype in spk_amp.dtypes]))
-            self.dask_chunksize = dask_chunksize
-            logger.info('Manual Dask chunksize: {}'.format(self.dask_chunksize))
-            logger.info('Expected worker peak memory usage: {:0.2f} MB'.format(self.dask_chunksize * memory_per_dec / 2**20))
-            logger.info('Worker total memory: UNKNOWN')
-
-        if dask_worker_memory is not None:
-            memory_per_dec = (len(spk_amp) * np.sum([np.dtype(dtype).itemsize for dtype in spk_amp.dtypes]))
-            self.dask_chunksize = np.int(dask_memory_utilization * dask_worker_memory / memory_per_dec)
-            logger.info('Dask chunksize: {}'.format(self.dask_chunksize))
-            logger.info('Memory utilization at: {:0.1f}%'.format(dask_memory_utilization * 100))
-            logger.info('Expected worker peak memory usage: {:0.2f} MB'.
-                        format(self.dask_chunksize * memory_per_dec / 2**20))
-
-        self.linflat = linflat
-        self.spk_amp = spk_amp
-        self.speed_thresh = speed_thresh
-        self.encode_settings = encode_settings
-        self.calc_occupancy()
-
-
-    def calc_occupancy(self):
-        occ, _ = np.histogram(a=self.linflat['linpos_flat'], bins=self.encode_settings.pos_bin_edges, normed=True)
-        self.occupancy = np.convolve(occ, self.encode_settings.pos_kernel)[int(len(occ)/2):int(len(occ)*3/2)]
-        return self.occupancy
-
-    def run_encoder(self):
-        logging.info("Setting up encoder dask task.")
-        task = self.setup_encoder_dask()
-        logging.info("Running compute tasks on dask workers.")
-        results = dask.compute(*task)
-        return results
-
-    def setup_encoder_dask(self):
-
-        grp = self.spk_amp.groupby('elec_grp_id')
-        observations = {}
-        task = []
-        for tet_id, spk_tet in grp:
-            spk_tet.index = spk_tet.index.droplevel('elec_grp_id')
-            tet_lin_pos = (self.linflat.get_irregular_resampled(spk_tet.index.get_level_values('timestamp'))
-                           .get_mapped_single_axis())
-            # tet_lin_pos = self.linflat.iloc[
-            #     self.linflat.index.get_level_values('timestamp').
-            #     get_indexer_for(spk_tet.index.get_level_values('timestamp'), method='nearest')
-            #     ]
-            # Velocity threshold on spikes and position
-            tet_lin_pos_thresh = tet_lin_pos.get_above_velocity(self.speed_thresh)
-            spk_tet_thresh = spk_tet.set_index(tet_lin_pos_thresh.index)
-            # Decode from all spikes
-            dask_spk_tet = dd.from_pandas(spk_tet.get_simple_index(), chunksize=self.dask_chunksize)
-
-            df_meta = pd.DataFrame([], columns=[pos_col_format(ii, self.encode_settings.pos_num_bins)
-                                                for ii in range(self.encode_settings.pos_num_bins)])
-
-            # Setup decode of all spikes from encoding of velocity threshold spikes
-            task.append(dask_spk_tet.map_partitions(functools.partial(self.compute_observ_tet, enc_spk=spk_tet_thresh,
-                                                                      tet_lin_pos=tet_lin_pos_thresh,
-                                                                      occupancy=self.occupancy,
-                                                                      encode_settings=self.encode_settings),
-                                                    meta=df_meta))
-
-        return task
-
-    def compute_observ_tet(self, dec_spk, enc_spk, tet_lin_pos, occupancy, encode_settings):
-
-        pos_distrib_tet = sp.stats.norm.pdf(np.expand_dims(encode_settings.pos_bins, 0),
-                                            np.expand_dims(tet_lin_pos['linpos_flat'], 1),
-                                            encode_settings.pos_kernel_std)
-
-        mark_contrib = normal_pdf_int_lookup(np.expand_dims(dec_spk, 1),
-                                             np.expand_dims(enc_spk, 0),
-                                             encode_settings.mark_kernel_std)
-
-        all_contrib = np.prod(mark_contrib, axis=2)
-
-        del mark_contrib
-
-        observ = np.matmul(all_contrib, pos_distrib_tet)
-
-        del all_contrib
-
-        # occupancy normalize
-        observ = observ / (occupancy + 1e-10)
-
-        # normalize each row
-        observ_sum = observ.sum(axis=1)
-        observ_sum_zero = observ_sum == 0
-        observ[observ_sum_zero, :] = 1/(self.encode_settings.pos_bins[-1] - self.encode_settings.pos_bins[0])
-        observ_sum[observ_sum_zero] = 1
-        observ = observ / observ.sum(axis=1)[:, np.newaxis]
-
-        ret_df = pd.DataFrame(observ, index=dec_spk.index,
-                              columns=[pos_col_format(pos_ii, observ.shape[1])
-                                       for pos_ii in range(observ.shape[1])])
-        return ret_df
-
-class OfflinePPDecoder(object):
-    """
-    Implementation of Adaptive Marked Point Process Decoder [Deng, et. al. 2015].
-
-    Requires linearized position (spykshrk.franklab.pp_decoder.LinearPositionContainer)
-    and spike observation containers (spykshrk.franklab.pp_decoder.SpikeObservation).
-    along with encoding (spykshrk.franklab.pp_decoder.EncodeSettings)
-    and decoding settings (spykshrk.franklab.pp_decoder.DecodeSettings).
-
-    """
-    def __init__(self, lin_obj: LinearPosition, observ_obj: SpikeObservation, encode_settings: EncodeSettings,
-                 decode_settings: DecodeSettings, which_trans_mat='learned', time_bin_size=30, parallel=True,
+    def __init__(self, linflat, enc_spk_amp, dec_spk_amp, encode_settings: EncodeSettings, decode_settings: DecodeSettings,
                  dask_worker_memory=None, dask_memory_utilization=0.5, dask_chunksize=None):
         """
-        Constructor for OfflinePPDecoder.
-
+        Constructor for OfflinePPEncoder.
+        
         Args:
-            lin_obj (LinearPositionContainer): Linear position of animal.
             observ_obj (SpikeObservation): Observered position distribution for each spike.
             encode_settings (EncodeSettings): Realtime encoder settings.
             decode_settings (DecodeSettings): Realtime decoder settings.
@@ -147,101 +30,177 @@ class OfflinePPDecoder(object):
             time_bin_size (float, optional): Delta time per bin to run decode, defaults to decoder_settings value.
         """
         if dask_worker_memory is None and dask_chunksize is None:
-            raise TypeError('OfflinePPDecoder requires either dask_memory or dask_chunksize to be set.')
+            raise TypeError('OfflinePPEncoder requires either dask_memory or dask_chunksize to be set.')
         if dask_worker_memory is not None and dask_chunksize is not None:
-            raise TypeError('OfflinePPDecoder only allows one to be set, dask_memory or dask_chunksize.')
+            raise TypeError('OfflinePPEncoder only allows one to be set, dask_memory or dask_chunksize.')
         if dask_chunksize is not None:
+            memory_per_dec = (len(enc_spk_amp) * np.sum([np.dtype(dtype).itemsize for dtype in enc_spk_amp.dtypes]))
             self.dask_chunksize = dask_chunksize
+            logger.info('Manual Dask chunksize: {}'.format(self.dask_chunksize))
+            logger.info('Expected worker peak memory usage: {:0.2f} MB'.format(self.dask_chunksize * memory_per_dec / 2**20))
+            logger.info('Worker total memory: UNKNOWN')
+
         if dask_worker_memory is not None:
-            memory_per_dec = (len(spk_amp) * np.sum([np.dtype(dtype).itemsize for dtype in spk_amp.dtypes]))
+            memory_per_dec = (len(enc_spk_amp) * np.sum([np.dtype(dtype).itemsize for dtype in enc_spk_amp.dtypes]))
             self.dask_chunksize = np.int(dask_memory_utilization * dask_worker_memory / memory_per_dec)
             logger.info('Dask chunksize: {}'.format(self.dask_chunksize))
             logger.info('Memory utilization at: {:0.1f}%'.format(dask_memory_utilization * 100))
-            logger.info('Expected worker memory usage: {:0.2f} MB'.format(self.dask_chunksize * memory_per_dec / 2**20))
+            logger.info('Expected worker peak memory usage: {:0.2f} MB'.
+                        format(self.dask_chunksize * memory_per_dec / 2**20))
 
-        self.lin_obj = lin_obj
-        self.observ_obj = observ_obj
-        self.observ_obj = observ_obj
+        self.linflat = linflat
+        self.enc_spk_amp = enc_spk_amp
+        self.dec_spk_amp = dec_spk_amp
         self.encode_settings = encode_settings
         self.decode_settings = decode_settings
-        self.which_trans_mat = which_trans_mat
-        self.time_bin_size = time_bin_size
 
-        if self.which_trans_mat == 'learned':
-            self.trans_mat = self.calc_learned_state_trans_mat(self.lin_obj.get_mapped_single_axis(),
-                                                               self.encode_settings, self.decode_settings)
-        elif self.which_trans_mat == 'simple':
-            self.trans_mat = self.calc_simple_trans_mat(self.encode_settings)
-        elif self.which_trans_mat == 'uniform':
-            self.trans_mat = self.calc_uniform_trans_mat(self.encode_settings)
+        self.calc_occupancy()
+        self.calc_firing_rate()
+        # self.calc_prob_no_spike()
 
-        self.parallel = parallel
+        self.trans_mat = dict.fromkeys(['learned', 'simple', 'uniform'])
+        self.trans_mat['learned']= self.calc_learned_state_trans_mat(self.linflat,self.encode_settings, self.decode_settings)
+        self.trans_mat['simple']= self.calc_simple_trans_mat(self.encode_settings)
+        self.trans_mat['uniform']=self.calc_uniform_trans_mat(self.encode_settings)
 
-        self.firing_rate = None
-        self.occupancy = None
-        self.prob_no_spike = None
-        self.likelihoods = None
-        self.posteriors = None
-        self.posteriors_obj = None
+    def run_encoder(self):
+        logging.info("Setting up encoder dask task.")
+        task = self.setup_encoder_dask()
+        logging.info("Running compute tasks on dask workers.")
+        self.results = dask.compute(*task)
+        return
 
-    def __del__(self):
-        print('decoder deleting')
+    def setup_encoder_dask(self):
+        # grp = self.spk_amp.groupby('elec_grp_id')
+        dec_grp = self.dec_spk_amp.groupby('elec_grp_id')
+        observations = {}
+        task = []
 
-    def run_decoder(self):
+        for dec_tet_id, dec_spk_tet in dec_grp:
+            enc_spk_tet = self.enc_spk_amp.query('elec_grp_id==@dec_tet_id')
+            # dec_spk_tet.index = dec_spk_tet.index.droplevel('elec_grp_id')
+            # enc_spk_tet.index = enc_spk_tet.index.droplevel('elec_grp_id')
+            if len(enc_spk_tet) == 0 | len(dec_spk_tet) == 0:
+                continue
+            enc_tet_lin_pos = self.linflat.get_irregular_resampled(enc_spk_tet)
+            if len(enc_tet_lin_pos) == 0:
+                continue
+            # Velocity threshold on spikes and position
+            # tet_lin_pos_thresh, vel_mask = tet_lin_pos.get_above_velocity(self.speed_thresh)
+            # spk_tet_thresh = spk_tet.reset_index(tet_lin_pos_thresh.index)
+            # spk_tet_thresh = spk_tet[vel_mask]
+            # Decode from all spikes
+            # dask_dec_spk_tet = dd.from_pandas(dec_spk_tet.get_simple_index(), chunksize=self.dask_chunksize)
+            mark_columns = dec_spk_tet.columns
+            index_columns = dec_spk_tet.index.names
+            dask_dec_spk_tet = dd.from_pandas(dec_spk_tet.reset_index(), chunksize=self.dask_chunksize)
+
+            df_meta = pd.DataFrame([], columns=[pos_col_format(ii, self.encode_settings.pos_num_bins)
+                                                for ii in range(self.encode_settings.pos_num_bins)])
+
+            # Setup decode of all spikes from encoding of velocity threshold spikes
+            task.append(dask_dec_spk_tet.map_partitions(functools.partial(self.compute_observ_tet, enc_spk=enc_spk_tet,
+                                                                      tet_lin_pos=enc_tet_lin_pos,
+                                                                      occupancy=self.occupancy,
+                                                                      encode_settings=self.encode_settings),
+                                                                      meta=df_meta,
+                                                                      mark_columns=mark_columns,
+                                                                      index_columns=index_columns))
+            # self.multiindex.append(dec_spk_tet.index)
+        return task
+
+    def compute_observ_tet(self, dec_spk, enc_spk, tet_lin_pos, occupancy, encode_settings, mark_columns, index_columns):
+
+        pos_distrib_tet = sp.stats.norm.pdf(np.expand_dims(encode_settings.pos_bins, 0),
+                                            np.expand_dims(tet_lin_pos['linpos_flat'], 1),
+                                            encode_settings.pos_kernel_std)
+        mark_contrib = normal_pdf_int_lookup(np.expand_dims(dec_spk[mark_columns], 1),
+                                             np.expand_dims(enc_spk, 0),
+                                             encode_settings.mark_kernel_std)
+        all_contrib = np.prod(mark_contrib, axis=2)
+        del mark_contrib
+        observ = np.matmul(all_contrib, pos_distrib_tet)
+        del all_contrib
+        # occupancy normalize 
+        observ = observ / (occupancy)
+        # normalize each row (#dec spks x #pos_bins)
+        observ_sum = observ.sum(axis=1)
+        observ_sum_zero = observ_sum == 0
+        observ[observ_sum_zero, :] = 1/(self.encode_settings.pos_bins[-1] - self.encode_settings.pos_bins[0])
+        # observ_sum[observ_sum_zero] = 1 #this isn't doing anything.. relic?
+        observ = observ / observ.sum(axis=1)[:, np.newaxis]
+        ret_df = pd.DataFrame(observ, index=dec_spk.set_index(index_columns).index,
+                              columns=[pos_col_format(pos_ii, observ.shape[1])
+                                       for pos_ii in range(observ.shape[1])])
+        return ret_df
+
+    def calc_occupancy(self):
+        self.occupancy = self._calc_occupancy(self.linflat, self.encode_settings)
+    def calc_firing_rate(self):
+        self.firing_rate = self._calc_firing_rate_tet(self.enc_spk_amp, self.linflat, self.encode_settings)
+    # def calc_prob_no_spike(self):
+        self.prob_no_spike = self._calc_prob_no_spike(self.firing_rate, self.occupancy, self.encode_settings, self.decode_settings)
+
+    @staticmethod
+    def _calc_occupancy(lin_obj: FlatLinearPosition, enc_settings: EncodeSettings):
         """
-        Run the decoder at a given time bin size.  Intermediate results are saved as
-        attributes to the class.
-
         Args:
-            time_bin_size (float, optional): Delta time per bin.
+            lin_obj (LinearPositionContainer): Linear position of the animal.
+            enc_settings (EncodeSettings): Realtime encoding settings.
+        Returns (np.array): The occupancy of the animal
+        """
+        occupancy, occ_bin_edges = np.histogram(lin_obj, bins=enc_settings.pos_bin_edges,
+                                                normed=True)
+        occupancy = np.convolve(occupancy, enc_settings.pos_kernel, mode='same')
+        occupancy += 1e10
+        return occupancy
 
-        Returns (pd.DataFrame): Final decoded posteriors that estimate position.
+    @staticmethod
+    def _calc_firing_rate_tet(observ: SpikeObservation, lin_obj: FlatLinearPosition, enc_settings: EncodeSettings):
+        # initialize conditional intensity function
+        firing_rate = {}
+        enc_tet_lin_pos = (lin_obj.get_irregular_resampled(observ))
+        enc_tet_lin_pos['elec_grp_id'] = observ.index.get_level_values(level='elec_grp_id')
+        tet_pos_groups = enc_tet_lin_pos.loc[:, ('elec_grp_id', 'linpos_flat')].groupby('elec_grp_id')
+        for tet_id, tet_spikes in tet_pos_groups:
+            tet_pos_hist, _ = np.histogram(tet_spikes, bins=enc_settings.pos_bin_edges)
+            firing_rate[tet_id] = tet_pos_hist
+        for fr_key in firing_rate.keys():
+            firing_rate[fr_key] = np.convolve(firing_rate[fr_key], enc_settings.pos_kernel, mode='same')
+            firing_rate[fr_key] = apply_no_anim_boundary(enc_settings.pos_bins, enc_settings.arm_coordinates,
+                                                         firing_rate[fr_key])
+            firing_rate[fr_key] = firing_rate[fr_key] / (firing_rate[fr_key].sum() * enc_settings.pos_bin_delta)
+        return firing_rate
+
+    @staticmethod
+    def _calc_prob_no_spike(firing_rate: dict, occupancy, enc_settings: EncodeSettings, dec_settings: DecodeSettings):
+        """
+        
+        Args:
+            firing_rate (pd.DataFrame): Occupancy firing rate, from calc_observation_intensity(...).
+            occupancy (np.array): The occupancy of the animal.
+            enc_settings (EncodeSettings): Realtime encode settings.
+            dec_settings (DecodeSettings): Realtime decoding settings.
+
+        Returns (dict[int, np.array]): Dictionary of probability that no spike occured per tetrode.
 
         """
+        prob_no_spike = {}
+        for tet_id, tet_fr in firing_rate.items():
+            prob_no_spike[tet_id] = np.exp(-dec_settings.time_bin_size/enc_settings.sampling_rate * tet_fr / occupancy)
+        return prob_no_spike
 
-        self.recalc_firing_rate()
-        self.recalc_occupancy()
-        self.recalc_prob_no_spike()
-        print("Beginning likelihood calculation")
-        self.recalc_likelihood()
-        print("Beginning posterior calculation")
-        self.recalc_posterior()
-
-        return self.posteriors_obj
-
-    def recalc_firing_rate(self):
-        self.firing_rate = self._calc_firing_rate_tet(self.observ_obj, self.encode_settings)
-
-    def recalc_occupancy(self):
-        self.occupancy = self.calc_occupancy(self.lin_obj, self.encode_settings)
-
-    def recalc_prob_no_spike(self):
-        self.prob_no_spike = self.calc_prob_no_spike(self.firing_rate, self.occupancy, self.encode_settings,
-                                                     self.decode_settings)
-
-    def recalc_likelihood(self):
-        self.likelihoods = self.calc_observation_intensity(self.observ_obj,
-                                                           self.prob_no_spike,
-                                                           self.encode_settings,
-                                                           self.decode_settings,
-                                                           time_bin_size=self.time_bin_size,
-                                                           chunksize=self.dask_chunksize)
-
-    def recalc_posterior(self):
-        self.posteriors = self.calc_posterior(self.likelihoods, self.trans_mat, self.encode_settings)
-        self.posteriors_obj = Posteriors.from_dataframe(self.posteriors, enc_settings=self.encode_settings,
-                                                        dec_settings=self.decode_settings)
-
+    
     @staticmethod
     def calc_learned_state_trans_mat(linpos_simple, enc_settings, dec_settings):
         """
         Calculate the point process transition matrix using the real behavior of the animal.
         This is the 2D matrix that defines the possible range of transitions in the position
         estimate.
-
+        
         The learned values are smoothed with a gaussian kernel and a uniform offset is added,
         specified by the encoding config.  The matrix is column normalized.
-
+        
         Args:
             linpos_simple (pd.DataFrame): Linear position pandas table with no MultiIndex.
             enc_settings (EncodeSettings): Encoder settings from a realtime config.
@@ -298,7 +257,7 @@ class OfflinePPDecoder(object):
     def calc_simple_trans_mat(enc_settings):
         """
         Calculate a simple point process transition matrix using a gaussian kernel.
-
+        
         Args:
             enc_settings (EncodeSettings): Encoder setting from realtime config.
 
@@ -331,7 +290,7 @@ class OfflinePPDecoder(object):
     def calc_uniform_trans_mat(enc_settings):
         """
         Calculate a simple uniform point process transition matrix.
-
+        
         Args:
             enc_settings (EncodeSettings): Encoder setting from realtime config.
 
@@ -351,16 +310,90 @@ class OfflinePPDecoder(object):
         transition_mat = np.nan_to_num(transition_mat)
 
         return transition_mat
+    
+
+
+class OfflinePPDecoder(object):
+    """
+    Implementation of Adaptive Marked Point Process Decoder [Deng, et. al. 2015].
+    
+    Requires spike observation containers (spykshrk.franklab.pp_decoder.SpikeObservation).
+    along with encoding (spykshrk.franklab.pp_decoder.EncodeSettings) 
+    and decoding settings (spykshrk.franklab.pp_decoder.DecodeSettings).
+    
+    """
+    def __init__(self, observ_obj: SpikeObservation, encode_settings: EncodeSettings,
+                 decode_settings: DecodeSettings, time_bin_size=30, parallel=True, trans_mat=None,
+                 prob_no_spike=None):
+        """
+        Constructor for OfflinePPDecoder.
+        
+        Args:
+            observ_obj (SpikeObservation): Observered position distribution for each spike.
+            encode_settings (EncodeSettings): Realtime encoder settings.
+            decode_settings (DecodeSettings): Realtime decoder settings.
+            
+            time_bin_size (float, optional): Delta time per bin to run decode, defaults to decoder_settings value.
+        """
+
+        self.prob_no_spike = prob_no_spike
+        self.trans_mat = trans_mat
+        self.observ_obj = observ_obj
+        self.encode_settings = encode_settings
+        self.decode_settings = decode_settings
+        # self.which_trans_mat = which_trans_mat
+        self.time_bin_size = time_bin_size
+
+        self.parallel = parallel
+
+        self.likelihoods = None
+        self.posteriors = None
+        self.posteriors_obj = None
+
+    def __del__(self):
+        print('decoder deleting')
+
+    def run_decoder(self):
+        """
+        Run the decoder at a given time bin size.  Intermediate results are saved as
+        attributes to the class.
+        
+        Args:
+            time_bin_size (float, optional): Delta time per bin.
+
+        Returns (pd.DataFrame): Final decoded posteriors that estimate position.
+
+        """
+
+        print("Beginning likelihood calculation")
+        self.recalc_likelihood()
+        print("Beginning posterior calculation")
+        self.recalc_posterior()
+
+        return self.posteriors_obj
+
+    def recalc_likelihood(self):
+        self.likelihoods = self.calc_observation_intensity(self.observ_obj,
+                                                           self.prob_no_spike,
+                                                           self.encode_settings,
+                                                           self.decode_settings,
+                                                           time_bin_size=self.time_bin_size)
+
+    def recalc_posterior(self):
+        self.posteriors = self.calc_posterior(self.likelihoods, self.trans_mat, self.encode_settings)
+        self.posteriors_obj = Posteriors.from_dataframe(self.posteriors, enc_settings=self.encode_settings,
+                                                        dec_settings=self.decode_settings)
+
+
 
     @staticmethod
     def calc_observation_intensity(observ: SpikeObservation,
                                    prob_no_spike,
                                    enc_settings: EncodeSettings,
                                    dec_settings: DecodeSettings,
-                                   time_bin_size=None,
-                                   chunksize=30000):
+                                   time_bin_size=None):
         """
-
+        
         Args:
             observ (SpikeObservation): Object containing observation data frame, one row per spike observed.
             enc_settings (EncodeSettings): Encoder settings from realtime config.
@@ -371,6 +404,7 @@ class OfflinePPDecoder(object):
             Dictionary of numpy arrays, one per tetrode, containing occupancy firing rate.
 
         """
+
         day = observ.index.get_level_values('day')[0]
         epoch = observ.index.get_level_values('epoch')[0]
 
@@ -384,7 +418,7 @@ class OfflinePPDecoder(object):
 
         observ.update_num_missing_future_bins(inplace=True)
 
-        observ_dask = dd.from_pandas(observ.get_no_multi_index(), chunksize=chunksize)
+        observ_dask = dd.from_pandas(observ.get_no_multi_index(), chunksize=30000)
         observ_grp = observ_dask.groupby('parallel_bin')
 
         observ_meta = [(key, 'f8') for key in [pos_col_format(ii, enc_settings.pos_num_bins)
@@ -436,7 +470,8 @@ class OfflinePPDecoder(object):
         #dec_grp = spikes_in_parallel.groupby('dec_bin')
 
         dec_grp = Groupby(spikes_in_parallel.values, spikes_in_parallel['dec_bin'].values)
-
+        # from IPython.core.debugger import set_trace
+        # set_trace()
         pos_col_ind = spikes_in_parallel.columns.slice_locs(enc_settings.pos_col_names[0],
                                                             enc_settings.pos_col_names[-1])
         elec_grp_ind = spikes_in_parallel.columns.get_loc('elec_grp_id')
@@ -490,70 +525,9 @@ class OfflinePPDecoder(object):
         return likelihoods
 
     @staticmethod
-    def _calc_firing_rate_tet(observ: SpikeObservation, enc_settings: EncodeSettings):
-        # initialize conditional intensity function
-        firing_rate = {}
-        tet_pos_groups = observ.loc[:, ('elec_grp_id', 'position')].groupby('elec_grp_id')
-
-        for tet_id, tet_spikes in tet_pos_groups:
-            tet_pos_hist, _ = np.histogram(tet_spikes, bins=enc_settings.pos_bin_edges)
-
-            firing_rate[tet_id] = tet_pos_hist
-
-
-        for fr_key in firing_rate.keys():
-            firing_rate[fr_key] = np.convolve(firing_rate[fr_key], enc_settings.pos_kernel, mode='same')
-
-            firing_rate[fr_key] = apply_no_anim_boundary(enc_settings.pos_bins, enc_settings.arm_coordinates,
-                                                         firing_rate[fr_key])
-
-            firing_rate[fr_key] = firing_rate[fr_key] / (firing_rate[fr_key].sum() * enc_settings.pos_bin_delta)
-
-        return firing_rate
-
-    @staticmethod
-    def calc_occupancy(lin_obj: LinearPosition, enc_settings: EncodeSettings):
-        """
-
-        Args:
-            lin_obj (LinearPositionContainer): Linear position of the animal.
-            enc_settings (EncodeSettings): Realtime encoding settings.
-
-        Returns (np.array): The occupancy of the animal
-
-        """
-        occupancy, occ_bin_edges = np.histogram(lin_obj.get_mapped_single_axis(), bins=enc_settings.pos_bin_edges,
-                                                normed=True)
-
-        occupancy = np.convolve(occupancy, enc_settings.pos_kernel, mode='same')
-
-        occupancy += 1e10
-
-        return occupancy
-
-    @staticmethod
-    def calc_prob_no_spike(firing_rate: dict, occupancy, enc_settings: EncodeSettings, dec_settings: DecodeSettings):
-        """
-
-        Args:
-            firing_rate (pd.DataFrame): Occupancy firing rate, from calc_observation_intensity(...).
-            occupancy (np.array): The occupancy of the animal.
-            enc_settings (EncodeSettings): Realtime encode settings.
-            dec_settings (DecodeSettings): Realtime decoding settings.
-
-        Returns (dict[int, np.array]): Dictionary of probability that no spike occured per tetrode.
-
-        """
-        prob_no_spike = {}
-        for tet_id, tet_fr in firing_rate.items():
-            prob_no_spike[tet_id] = np.exp(-dec_settings.time_bin_size/enc_settings.sampling_rate * tet_fr / occupancy)
-
-        return prob_no_spike
-
-    @staticmethod
     def calc_posterior(likelihoods, transition_mat, enc_settings: EncodeSettings):
         """
-
+        
         Args:
             likelihoods (pd.DataFrame): The evaluated likelihood function per time bin, from calc_likelihood(...).
             transition_mat (np.array): The point process state transition matrix.

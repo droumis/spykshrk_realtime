@@ -11,7 +11,7 @@ import datashader as ds
 
 import functools
 
-from spykshrk.franklab.pp_decoder.data_containers import pos_col_format, Posteriors, LinearPosition, \
+from spykshrk.franklab.data_containers import pos_col_format, Posteriors, LinearPosition, \
     EncodeSettings, StimLockout, RippleTimes
 
 idx = pd.IndexSlice
@@ -37,7 +37,7 @@ class DecodeVisualizer:
         self.riptimes = riptimes
         if riptimes is not None:
             self.posteriors.apply_time_event(riptimes, event_mask_name='ripple_grp')
-        self.linflat = linpos.get_mapped_single_axis()
+        self.linflat = linpos #.get_mapped_single_axis()
         if riptimes is not None:
             self.linflat.apply_time_event(riptimes, event_mask_name='ripple_grp')
         self.enc_settings = enc_settings
@@ -77,9 +77,9 @@ class DecodeVisualizer:
         # img = img.redim(probability={'range': (0, 0.3)})
         # img.extents = (sel_range[0], 0, sel_range[1], self.enc_settings.pos_bins[-1])
         self.post_img.extents = (sel_range[0], 0, sel_range[1], self.enc_settings.pos_bins[-1])
-
-        rgb = shade(regrid(self.post_img, aggregator='mean', dynamic=False,
-                           x_range=x_range, y_range=y_range), cmap=plt.get_cmap('hot'),
+        self.post_img.relabel('posteriors')
+        rgb = shade(regrid(self.post_img, aggregator='max', dynamic=False,
+                           x_range=x_range, y_range=y_range), cmap=plt.get_cmap('magma'),
                     normalization='linear', dynamic=False)
         # rgb = shade(regrid(self.post_img, aggregator='mean', dynamic=False,
         #                    x_range=x_range, y_range=y_range, y_sampling=1, x_sampling=0.001),
@@ -95,7 +95,7 @@ class DecodeVisualizer:
 
         boxes = [rect(entry.starttime, entry.endtime, self.enc_settings.pos_bins[0], self.enc_settings.pos_bins[-1])
                  for entry in self.riptimes.itertuples()]
-        poly = hv.Polygons(boxes)
+        poly = hv.Polygons(boxes, group='events', label='ripples')
         poly.extents = (time, self.enc_settings.pos_bins[0], time+plt_range, self.enc_settings.pos_bins[-1])
         return poly
 
@@ -115,7 +115,7 @@ class DecodeVisualizer:
                 #line = hv.Curve((x_range, [bound]*2)).opts(style={'line_dash': 'dashed', 'line_color': 'grey'})
                 line = hv.Curve((x_range, [bound]*2),
                                 extents=(x_range[0], None, x_range[1], None),
-                                group='arm_bound').opts(style={'color': '#AAAAAA',
+                                group='arm_bound', label='track_arms').opts(style={'color': '#AAAAAA',
                                                                'line_dash': 'dashed',
                                                                'line_color': 'grey',
                                                                'linestyle': '--'})
@@ -127,7 +127,7 @@ class DecodeVisualizer:
         linflat_sel_data = self.linflat['linpos_flat'].values
         linflat_sel_time = self.linflat.index.get_level_values('time')
         pos = hv.Points((linflat_sel_time, linflat_sel_data), kdims=[self.time_dim_name, self.pos_dim_name],
-                        extents=(time, None, time + plt_range, None))
+                        extents=(time, None, time + plt_range, None), label='flat_linear_position')
 
         return pos
 
@@ -153,8 +153,7 @@ class DecodeVisualizer:
                                slide)
 
         dmap = hv.DynamicMap(functools.partial(self.plot_all, plt_range=plt_range),
-                             kdims=hv.Dimension('time',
-                                                values=values),
+                             kdims=hv.Dimension('time', values=values),
                              streams=[stream])
         return dmap
 
@@ -189,7 +188,7 @@ class DecodeVisualizer:
 
     def plot_ripple_dynamic(self):
         dmap = hv.DynamicMap(self.plot_ripple_all,
-                             kdims=hv.Dimension('rip_ind', range=(0, self.riptimes.get_num_events())))
+                             kdims=hv.Dimension('rip_ind', range=(1, self.riptimes.get_num_events())))
 
         return dmap
 
