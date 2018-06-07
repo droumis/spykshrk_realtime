@@ -16,3 +16,5 @@ _templates/
 *.swp
 dask-worker-space/
 .nfs*
+.vscode*
+metastore_db/
