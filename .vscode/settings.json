@@ -1,4 +1,4 @@
 {
     "python.pythonPath": "/home/droumis/anaconda3/bin/python",
-    "python.linting.enabled": true
+    "python.linting.enabled": false
 }
