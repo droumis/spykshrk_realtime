@@ -8,8 +8,7 @@ import pandas as pd
 import scipy as sp
 import scipy.signal
 
-from spykshrk.franklab.data_containers import LinearPosition, FlatLinearPosition, SpikeObservation,\
- EncodeSettings, DecodeSettings, Posteriors, pos_col_format
+from spykshrk.franklab.data_containers import LinearPosition, FlatLinearPosition, SpikeObservation, EncodeSettings, DecodeSettings, Posteriors, pos_col_format
 from spykshrk.franklab.pp_decoder.util import gaussian, normal2D, apply_no_anim_boundary, normal_pdf_int_lookup
 from spykshrk.util import Groupby
 
@@ -23,11 +22,12 @@ class OfflinePPEncoder(object):
         Constructor for OfflinePPEncoder.
         
         Args:
-            observ_obj (SpikeObservation): Observered position distribution for each spike.
+            linflat (FlatLinearPosition): Observered 1D unique animal position
+            enc_spk_amp (SpikeObservation): Observered spikes in encoding model
+            dec_spk_amp (SpikeObservation): Observered spikes in decoding model
             encode_settings (EncodeSettings): Realtime encoder settings.
             decode_settings (DecodeSettings): Realtime decoder settings.
-            which_trans_mat (str): Which point process transition matrix to use (learned, simple, uniform).
-            time_bin_size (float, optional): Delta time per bin to run decode, defaults to decoder_settings value.
+
         """
         if dask_worker_memory is None and dask_chunksize is None:
             raise TypeError('OfflinePPEncoder requires either dask_memory or dask_chunksize to be set.')
@@ -56,7 +56,7 @@ class OfflinePPEncoder(object):
 
         self.calc_occupancy()
         self.calc_firing_rate()
-        # self.calc_prob_no_spike()
+        # self.calc_prob_no_spike() #weird bug. direct calls to calc_prob_no_spike failed, but were fine when imbedding into the calc_firing_rate call above
 
         self.trans_mat = dict.fromkeys(['learned', 'simple', 'uniform'])
         self.trans_mat['learned']= self.calc_learned_state_trans_mat(self.linflat,self.encode_settings, self.decode_settings)
@@ -78,19 +78,12 @@ class OfflinePPEncoder(object):
 
         for dec_tet_id, dec_spk_tet in dec_grp:
             enc_spk_tet = self.enc_spk_amp.query('elec_grp_id==@dec_tet_id')
-            # dec_spk_tet.index = dec_spk_tet.index.droplevel('elec_grp_id')
-            # enc_spk_tet.index = enc_spk_tet.index.droplevel('elec_grp_id')
             if len(enc_spk_tet) == 0 | len(dec_spk_tet) == 0:
                 continue
             enc_tet_lin_pos = self.linflat.get_irregular_resampled(enc_spk_tet)
             if len(enc_tet_lin_pos) == 0:
                 continue
-            # Velocity threshold on spikes and position
-            # tet_lin_pos_thresh, vel_mask = tet_lin_pos.get_above_velocity(self.speed_thresh)
-            # spk_tet_thresh = spk_tet.reset_index(tet_lin_pos_thresh.index)
-            # spk_tet_thresh = spk_tet[vel_mask]
-            # Decode from all spikes
-            # dask_dec_spk_tet = dd.from_pandas(dec_spk_tet.get_simple_index(), chunksize=self.dask_chunksize)
+            # maintain elec_grp_id info. get mark and index column names to reindex dask arrays
             mark_columns = dec_spk_tet.columns
             index_columns = dec_spk_tet.index.names
             dask_dec_spk_tet = dd.from_pandas(dec_spk_tet.reset_index(), chunksize=self.dask_chunksize)
@@ -98,7 +91,7 @@ class OfflinePPEncoder(object):
             df_meta = pd.DataFrame([], columns=[pos_col_format(ii, self.encode_settings.pos_num_bins)
                                                 for ii in range(self.encode_settings.pos_num_bins)])
 
-            # Setup decode of all spikes from encoding of velocity threshold spikes
+            # Setup decode of decode spikes from encoding of encoding spikes
             task.append(dask_dec_spk_tet.map_partitions(functools.partial(self.compute_observ_tet, enc_spk=enc_spk_tet,
                                                                       tet_lin_pos=enc_tet_lin_pos,
                                                                       occupancy=self.occupancy,
@@ -106,7 +99,6 @@ class OfflinePPEncoder(object):
                                                                       meta=df_meta,
                                                                       mark_columns=mark_columns,
                                                                       index_columns=index_columns))
-            # self.multiindex.append(dec_spk_tet.index)
         return task
 
     def compute_observ_tet(self, dec_spk, enc_spk, tet_lin_pos, occupancy, encode_settings, mark_columns, index_columns):
@@ -127,7 +119,7 @@ class OfflinePPEncoder(object):
         observ_sum = observ.sum(axis=1)
         observ_sum_zero = observ_sum == 0
         observ[observ_sum_zero, :] = 1/(self.encode_settings.pos_bins[-1] - self.encode_settings.pos_bins[0])
-        # observ_sum[observ_sum_zero] = 1 #this isn't doing anything.. relic?
+        observ_sum[observ_sum_zero] = 1
         observ = observ / observ.sum(axis=1)[:, np.newaxis]
         ret_df = pd.DataFrame(observ, index=dec_spk.set_index(index_columns).index,
                               columns=[pos_col_format(pos_ii, observ.shape[1])
@@ -357,9 +349,6 @@ class OfflinePPDecoder(object):
         """
         Run the decoder at a given time bin size.  Intermediate results are saved as
         attributes to the class.
-        
-        Args:
-            time_bin_size (float, optional): Delta time per bin.
 
         Returns (pd.DataFrame): Final decoded posteriors that estimate position.
 
@@ -470,8 +459,6 @@ class OfflinePPDecoder(object):
         #dec_grp = spikes_in_parallel.groupby('dec_bin')
 
         dec_grp = Groupby(spikes_in_parallel.values, spikes_in_parallel['dec_bin'].values)
-        # from IPython.core.debugger import set_trace
-        # set_trace()
         pos_col_ind = spikes_in_parallel.columns.slice_locs(enc_settings.pos_col_names[0],
                                                             enc_settings.pos_col_names[-1])
         elec_grp_ind = spikes_in_parallel.columns.get_loc('elec_grp_id')
