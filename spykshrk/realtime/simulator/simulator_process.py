@@ -1,10 +1,5 @@
-import sys
-
 from mpi4py import MPI
-import threading
-import struct
 import time
-import numpy as np
 
 import spykshrk.realtime.realtime_logging as rt_logging
 import spykshrk.realtime.realtime_base as realtime_base
@@ -12,7 +7,6 @@ import spykshrk.realtime.datatypes as datatypes
 import spykshrk.realtime.simulator.nspike_data as nspike_data
 import spykshrk.realtime.simulator.sim_databuffer as sim_databuffer
 from spykshrk.realtime import binary_record
-import spykshrk.realtime.timing_system as timing_system
 
 
 class SimulatorError(RuntimeError):

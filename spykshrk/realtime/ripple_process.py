@@ -10,6 +10,7 @@ import spykshrk.realtime.realtime_base as realtime_base
 import spykshrk.realtime.realtime_logging as rt_logging
 import spykshrk.realtime.simulator.simulator_process as simulator_process
 import spykshrk.realtime.timing_system as timing_system
+import spykshrk.realtime.trodes
 from spykshrk.realtime.datatypes import LFPPoint
 from spykshrk.realtime.realtime_base import ChannelSelection, TurnOnDataStream
 
@@ -155,7 +156,7 @@ class RippleFilter(rt_logging.LoggingClass):
 
     @property
     def custom_baseline_std(self):
-        return self._custom_baseline_mean
+        return self._custom_baseline_std
 
     @custom_baseline_std.setter
     def custom_baseline_std(self, value):
@@ -338,7 +339,7 @@ class RippleMPISendInterface(realtime_base.RealtimeMPIClass):
 
 class RippleManager(realtime_base.BinaryRecordBaseWithTiming, rt_logging.LoggingClass):
     def __init__(self, rank, local_rec_manager, send_interface: RippleMPISendInterface,
-                 data_interface: simulator_process.SimulatorRemoteReceiver):
+                 data_interface: realtime_base.DataSourceReceiver):
         super().__init__(rank=rank,
                          local_rec_manager=local_rec_manager,
                          send_interface=send_interface,
@@ -376,7 +377,6 @@ class RippleManager(realtime_base.BinaryRecordBaseWithTiming, rt_logging.Logging
         self.class_log.debug("Registering continuous channels: {:}.".format(ntrode_list))
         for electrode_group in ntrode_list:
             self.data_interface.register_datatype_channel(channel=electrode_group)
-
             self.ripple_filters.setdefault(electrode_group, RippleFilter(rec_base=self, param=self.param,
                                                                          elec_grp_id=electrode_group))
 
@@ -554,20 +554,26 @@ class RippleProcess(realtime_base.RealtimeProcess):
 
         if self.config['datasource'] == 'simulator':
             data_interface = simulator_process.SimulatorRemoteReceiver(comm=self.comm,
-                                                                       rank=self.rank,
-                                                                       config=self.config,
-                                                                       datatype=datatypes.Datatypes.LFP)
-
-            self.rip_man = RippleManager(rank=rank,
-                                         local_rec_manager=self.local_rec_manager,
-                                         send_interface=self.mpi_send,
-                                         data_interface=data_interface)
-
-            self.mpi_recv = RippleMPIRecvInterface(self.comm, self.rank, self.config, self.rip_man)
+                                                                    rank=self.rank,
+                                                                    config=self.config,
+                                                                    datatype=datatypes.Datatypes.LFP)
+        elif self.config['datasource'] == 'trodes':
+            data_interface = spykshrk.realtime.trodes.TrodesDataReceiver(comm=self.comm,
+                                                                         rank=self.rank,
+                                                                         config=self.config,
+                                                                         datatype=datatypes.Datatypes.LFP)
         else:
             raise realtime_base.DataSourceError("No valid data source selected")
 
+        self.rip_man = RippleManager(rank=rank,
+                                    local_rec_manager=self.local_rec_manager,
+                                    send_interface=self.mpi_send,
+                                    data_interface=data_interface)
+
+        self.mpi_recv = RippleMPIRecvInterface(self.comm, self.rank, self.config, self.rip_man)
+
         self.terminate = False
+        # config['trodes_network']['networkobject'].registerTerminateCallback(self.trigger_termination)
 
         # First Barrier to finish setting up nodes
         self.class_log.debug("First Barrier")
